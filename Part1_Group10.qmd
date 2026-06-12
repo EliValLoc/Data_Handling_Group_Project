@@ -1,0 +1,1542 @@
+---
+title: "Group Project Part 1 - Group 10"
+subtitle: "3,230: Data Handling: Import, Cleaning and Visualisation - Autumn Semester 2025"
+author:
+  - name: Alessio De Simeis (24-621-476)
+  - name: Elia Valentin Locher (21-941-000)
+  - name: Marco Molnar (21-917-315)
+  - name: Lars Wyssen (24-617-771)
+date: "November 2025"
+format:
+  html:
+    embed-resources: true
+    self-contained: true
+    self-contained-math: true
+    toc: true
+    toc-location: left
+    toc-depth: 6
+    theme: cosmo
+    code-fold: true
+    code-tools: true 
+highlight-style: dracula
+---
+
+```{r setup, echo = FALSE, eval = TRUE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = TRUE, eval = TRUE)
+```
+
+# R Setup
+
+```{r}
+# Load necessary libraries
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+
+# Appended libraries
+library(httr2) # for API requests
+library(openxlsx) # to import the WHO Excel File
+library(purrr) # to create dataframe with map_dfr()
+library(xml2) # to process xml from OECD structure query
+library(skimr) # to explore the data set created easily
+library(ggplot2) # to create visually appealing diagrams
+
+# To prevent globally scientific notation
+options(scipen = 999)
+```
+
+---
+
+# Homework Part 1 (due November 6th, 2025)
+
+*The relationship between health expenditures and health outcomes has long been a central topic in health economics. Empirical studies show a positive but non-linear relationship between health spending and outcomes such as life expectancy, particularly in low- and middle-income countries.*
+
+*In high-income settings, however, diminishing returns are evident. For example, the United States spends more per capita on health than any other nation, yet its health outcomes often lag behind those of countries with lower spending.*
+
+*In this group project, we want to investigate the relationship between health expenditures and health outcomes.*
+
+---
+
+## 1.1 Importing data on healthcare expenditures per capita
+
+### 1.1.1. Current health expenditure per capita and current health expenditure (% of GDP)
+
+*Use your favorite method and present one solution. We explored different approaches to using APIs in Minna Heim’s guest lecture. Explain the method of your choice in your own words and justify why you chose it. [5pts]*
+
+#### Alternative 1: VIA API Call
+
+##### Testing a single API call (limited to 1000 rows)
+
+We first want to test a simple API call (only retrieving the first 1000 entries). This helps us to build in a next step a function that automatically retrieves all data of a specific indicator and other variables.
+
+```{r}
+get_health_expenditure <- function(data = "data", database_id = "WB_WDI", indicator = "WB_WDI_SH_XPD_CHEX_PC_CD", ref_area = NULL, start_year = "2000", end_year = "2022", observations = "0"){
+  
+  base_url <- "https://data360api.worldbank.org/data360"
+
+
+# using magrittr pipe
+  req <- request(base_url) %>%
+    req_url_path_append(data) %>%
+    req_url_query(
+      DATABASE_ID = database_id, 
+      INDICATOR = indicator,
+      REF_AREA = ref_area,
+      timePeriodFrom = start_year, 
+      timePeriodTo = end_year,
+      skip = observations)
+  
+  # get request and store answer in resp variable
+  resp <- req_perform(req)
+  
+  # if request is not successful give an error message.
+  if (resp_status(resp) != 200){
+    message("The request was not successful")
+  }
+  else{
+    return(resp_body_json(resp))
+  }
+}
+
+# call the function
+data_exppc <- get_health_expenditure("data", "WB_WDI", "WB_WDI_SH_XPD_CHEX_PC_CD", ,"2000", "2022", "0")
+data_exp <- get_health_expenditure("data", "WB_WDI", "WB_WDI_SH_XPD_CHEX_GD_ZS", ,"2000", "2023", "0")
+
+# Extract all values
+all_values_exppc <- lapply(data_exppc$value, function(x) unlist(x, use.names = TRUE))
+all_values_exp <- lapply(data_exp$value, function (x) unlist(x, use.names = TRUE))
+
+df_exppc <- as.data.frame(do.call(rbind, all_values_exppc), stringsAsFactors = FALSE)
+df_exp <- as.data.frame(do.call(rbind, all_values_exp), stringsAsFactors = FALSE)
+
+```
+
+In a last step we have to transform the columns into an appropriate `datatype`.
+
+```{r}
+# first for the expenditures in % of GDP
+df_exp$OBS_VALUE <- as.numeric(df_exp$OBS_VALUE)
+df_exp$DECIMALS <- as.numeric(df_exp$DECIMALS)
+df_exp$TIME_PERIOD <- as.numeric(df_exp$TIME_PERIOD)
+
+# then for the expenditures per capita
+df_exppc$OBS_VALUE <- as.numeric(df_exppc$OBS_VALUE)
+df_exppc$DECIMALS <- as.numeric(df_exppc$DECIMALS)
+df_exppc$TIME_PERIOD <- as.numeric(df_exppc$TIME_PERIOD)
+
+# statistical summary of exp. in % of GDP
+skim(df_exp)
+
+# statistical summary of exp. per capita
+skim(df_exppc)
+```
+---
+
+##### API Function to retrieve all Data/create full dataset
+
+We now use the function above as a basis and expand it in order to not only retrieve the first 1000 observations, but the whole dataset. Thus, we have to paginate API requests in 1000-record steps using the `skip`-parameter.
+
+:::{.callout-note}
+This function will be used several times in this Quarto Notebook to retrieve different datasets of the World Bank. During the process of answering the questions of this assignment, we had to expand the function with additional parameters a few times (e.g. `REF_AREA` or `.multi`). With this end result, we are able to retrieve all required data from the World Bank.
+:::
+
+```{r}
+get_all_data <- function(
+    data = "data", 
+    database_id = "WB_WDI",
+    indicator = "WB_WDI_SH_XPD_CHEX_PC_CD",
+    ref_area = NULL,
+    start_year = "2000",
+    end_year = "2022") {
+  
+  base_url = "https://data360api.worldbank.org/data360"
+  skip <- 0
+  all_values <- list()
+  
+  repeat{
+    message(paste("Fetching data for", indicator, "- skip =", skip))
+    
+    #API request
+    req <- request(base_url) %>%
+      req_url_path_append(data) %>%
+      req_url_query(
+        DATABASE_ID = database_id,
+        INDICATOR = indicator,
+        REF_AREA = ref_area,
+        timePeriodFrom = start_year,
+        timePeriodTo = end_year,
+        skip = skip,
+        .multi = "comma" # vector entry is separated by a comma (useful if we have e.g. a vector of REF_AREA)
+      )
+    
+    resp <- req_perform(req)
+    
+    # Control whether successful or no more data
+    if (resp_status(resp) != 200) {
+      message("Request failed at skip =", skip)
+      break
+    }
+    
+    data_json <- resp_body_json(resp)
+    
+    if(is.null(data_json) || length(data_json$value) == 0) {
+      message("No more data available.")
+      break
+    }
+    
+    # Extract all values and append them to the list
+    all_values <- c(all_values, lapply(data_json$value, function(x) unlist(x, use.names = TRUE)))
+    
+    # Iterate to next 1000 datapoints
+    skip <- skip + 1000
+  }
+  
+  # Transform complete list into a dataframe
+  df <- as.data.frame(do.call(rbind, all_values), stringsAsFactors = FALSE)
+  
+  # Convert selected columns into the correct dataformat, if corresponding columns exist
+  if("OBS_VALUE" %in% names(df)) df$OBS_VALUE <- as.numeric(df$OBS_VALUE)
+  if("DECIMALS" %in% names(df)) df$DECIMALS <- as.numeric(df$DECIMALS)
+  if("TIME_PERIOD" %in% names(df)) df$TIME_PERIOD <- as.numeric(df$TIME_PERIOD)
+  
+  message("Download completed for indicator: ", indicator)
+  
+  return(df)
+}
+```
+
+---
+
+##### Retrieving Health Expenditure per capita (in current US$)
+
+Having set up the function, we can now retrieve the health expenditure per capita.
+
+```{r}
+#| message: true
+# retrieve dataframe for current health expenditure per capita (in current US$)
+df_exppc_all <- get_all_data(
+  indicator = "WB_WDI_SH_XPD_CHEX_PC_CD",
+  start_year = "2000",
+  end_year = "2022"
+)
+
+skim(df_exppc_all)
+```
+To gain a clearer overview of the dataset, we begin by examining the range of countries represented in the data frame. The variable *REF_AREA* contains the country or region codes that identify the geographical scope of each observation.
+By exploring these codes, we can understand the global coverage of the dataset and verify which countries or regional aggregates are included.
+
+In total, the dataset comprises a wide array of country and regional codes such as:
+
+```{r}
+# show all country codes in the retrieved dataframe
+country_codes <- df_exppc_all %>%
+  distinct(REF_AREA) %>%
+  arrange(REF_AREA) %>%
+  pull(REF_AREA)
+
+country_codes
+
+# show the number od different countries
+country_unique <- df_exppc_all %>% summarise(n_countries = n_distinct(REF_AREA))
+```
+These codes correspond to a mix of individual countries (e.g., AFG for Afghanistan, DEU for Germany, USA for the United States) and regional groupings (e.g., EAP for East Asia & Pacific, EUU for European Union, WLD for World).
+This broad representation highlights that the dataset provides information at both national and aggregate regional levels, allowing for diverse cross-country analyses.
+
+**We conclude that we have `r nrow(df_exppc_all)` observations for `r country_unique` different countries.** 
+
+---
+
+##### Retrieving Data for Current Health Expenditure in % of GDP
+
+In a next step, we can import health expenditure in % of GDP with the same function.
+
+
+```{r}
+#| message: true
+# retrieve dataframe for current health expenditure (in % of GDP)
+df_exp_all <- get_all_data(
+  indicator = "WB_WDI_SH_XPD_CHEX_GD_ZS",
+  start_year = "2000",
+  end_year = "2023"
+)
+
+skim(df_exp_all)
+```
+::: {.callout-important title="Short Check"}
+Since our timerange now includes one additional year, we have `r nrow(df_exp_all)` observations. This seems to be plausible.
+:::
+
+---
+
+#### Alternative 2: Naive Way 
+
+Another approach, as we saw in the guest lecture about Swiss GDP data from BFS, we can manually download as CSV file of expenditure per capita (in current US$).
+
+```{r}
+df_exppc_csv <- read.csv("../Data/WB_WDI_SH_XPD_CHEX_PC_CD.csv")
+
+# Note that the range of the timeperiod is from 2000-2023. Since we are only interested in data from 2000-2022 we filter the df
+df_exppc_csv_filtered <- df_exppc_csv %>%
+  filter(TIME_PERIOD != "2023")
+
+skim(df_exppc_csv_filtered)
+```
+From exploring the data set, we can see that: 
+
+::: {.callout-important title="Short Check"}
+The number of rows of the naive way equals the number of rows we received via the API call. Nevertheless, we want to check on a high-level, whether both methods lead to the same data.
+:::
+
+---
+
+#### Control of both Methods
+
+:::{.callout-note}
+For control purposes we are curious whether both ways lead to the same result or if there are differences between both datasets. The first approach is to find the unique entries of each column of both dataframes and compare them with each other.
+:::
+
+```{r}
+# first make sure we don't have Nan's in our df's
+colSums(is.na(df_exppc_all))
+colSums(is.na(df_exppc_csv_filtered))
+
+# In a next step check the unique colnames of each dataframe
+# first, find all intersected column names of both df's
+common_cols <- intersect(names(df_exppc_all), names(df_exppc_csv_filtered))
+
+# Use these columns (excluding OBS_VALUE) to check wheter the unique entries of each columns are identical
+col_to_use <- setdiff(common_cols, "OBS_VALUE")
+unique_df_all <- lapply(df_exppc_all[, col_to_use], unique)
+unique_df_csv <- lapply(df_exppc_csv_filtered[, col_to_use], unique)
+compare_unique <- mapply(function(x, y) all(sort(x) == sort(x)),
+                         unique_df_all,
+                         unique_df_csv)
+# Check the results
+compare_unique
+```
+
+We see that all of the unique entries of each of the selected columns are identical and that we have no NaN's. However, we want to use an additional approach that provides more details: it is to look at the number of entries for each unique attribute of a column. That will deliver us a more detailed answer, whether there are differences between both methods.
+
+```{r}
+# First, create a table for each column that includes the occurrence of each unqique column entry
+freq_all <- lapply(df_exppc_all[, col_to_use], table)
+freq_csv <- lapply(df_exppc_csv_filtered[, col_to_use], table)
+
+# we now create for each col_to_use a dataframe which includes for all unique entries of the column the respective occurance number. These dataframes of both (df_api and df_csv) are then merged. We should then get a dataframe for each of the selected columns and can observe the unique attribute occurrence.
+compare_freq <- lapply(col_to_use, function(col) {
+  df_api <- as.data.frame(freq_all[[col]])
+  df_csv <- as.data.frame(freq_csv[[col]])
+  
+  names(df_api) <- c("value", "count_api")
+  names(df_csv) <- c("value", "count_csv")
+  
+  merge(df_api, df_csv, by = "value", all = TRUE)
+})
+
+# note that we only printed the frist 3 observations of the dataframes
+# otherwise the output would be quite large in the HTML-file
+for(d in compare_freq){
+  print(head(d, 3))
+}
+```
+
+We can easily see, that the selected columns have the same number for each variable in this column. Hence, both methods lead to the same result. When comparing the statistical `summary()` function we can further check, whether the distribution of the numeric variables is equal. And indeed, this also holds.
+
+So the only difference between the `API-call` and the `Naive` method lies in the selection of the retrieved columns: While the API request only retrieves 22 features, the static CSV-download consists of 45 features. This leads us to the discussion about the advantages of retrieving data via an API.
+
+---
+
+#### Summary - Why did we choose API?
+
+The method we used to retrieve the data is a classic `API GET-request` to retrieve the data. In simple terms, this means we send a structured request to the World Bank's data server (its "Application Programming Interface"), asking it to return specific data that we defined in the query. The server then sends back the requested data (its response), typically in a JSON format, which we can directly import, process, and analyze in R. In our case, the API request was implemented through a `custom R function` that automatically retrieves healthcare expenditure data for defined time periods and indicators.
+
+We chose this approach for several reasons:
+
+**1. Automation and efficiency**<br> Once the API function is setup, it allows for **fully automated data retrieval**. This is particularly useful when working with multiple datasets or when data updates frequently. Instead of manually downloading each dataset, we can re-run the function and instantly obtain the most recent data.
+
+**2. Targeted and cleaner data collection** <br> 
+Using an API makes it possible to **precisely specify parameters**, such as indicator codes and time periods, directly in the request. This means that only the relevant data is downloaded, **minimizing the need for extensive post-processing or filtering**. For example, we were able to define the `TIME_PERIOD` parameter in our query, while a manual download required additional filtering within a large general dataset. This advantage of an API is especially strong, when we have to retrieve several large Datasets (not only around 5400 entries of 22 features). So less downloading, reading, cleaning of data.
+
+**3. Access to up-to-date information** <br> 
+API access ensures that we always retrieve the **latest available version** of the dataset. In contrast, manually downloaded CSV files only reflect the data as of their last update. Any new data released by the World Bank would require a new manual download and replacement of the old file.
+
+::: {.callout-tip title="Summary"}
+Overall, using an API is a **flexible, scalable, and reproducible** approach to data collection. It greatly reduces the need for manual downloading, file handling, and data cleaning, while ensuring that analyses are always based on the most current information available
+:::
+
+To evaluate our API-approach, we also tested the "naive" method, by manually downloading the CSV files from the World Bank's Website. Since we only needed two indicators/datasets, this method was indeed faster for a one-time task, as it did not require writing an API function or consulting the documentation. However, the advantages outlined above clearly demonstrate the long-term benefits of using an API for systematic, repeatable, and large-scale data retrieval.
+
+---
+
+### 1.1.2 What are the healthcare expenditures for Albania in 2005 in % of GDP?
+
+*Explore your dataset and report the healthcare expenditures for Albania in 2005, expressed as a percentage of GDP. Round the value to two decimal places. [1 pt]*
+
+```{r}
+exp_ALB <- round(df_exp_all %>%
+  filter(REF_AREA == "ALB",
+         TIME_PERIOD == "2005"
+         
+         ) %>%
+  select(OBS_VALUE), 2)
+cat(paste0('The healthcare expenditures for Albania in 2005, expressed as % of GDP are: ', exp_ALB$OBS_VALUE, "%."))
+```
+
+---
+
+### 1.1.3 Plausibility checks
+
+*Are these data similar to the WHO data on health expenditures? Have a look at the WHO website.*
+
+#### Why do we conduct Plausibility Checks?
+
+*Why is it important to compare the same indicators from different sources? [1 pt]*
+
+Comparing the same indicators across multiple reputable sources is essential to ensure **data reliability and validity**. Different organizations, such as the World Bank and WHO, may use different methodologies, estimation techniques, or rounding conventions when collecting and reporting data. By cross-checking the figures, we can identify potential discrepancies, confirm that our data processing is correct, and build confidential results. This is particularly important in research and policy analysis, where decisions are based on accurate and trustworthy information.
+
+Overall, such comparisons help **detect errors, improve transparency, and ensure that conclusions drawn from the data are robust.**
+
+---
+
+#### Plausibility Check using WHO Data Explorer
+
+*Use the WHO Data Explorer to find health expenditures in Albania in 2005. Are the results similar to your findings? [1 pt]*
+
+To answer this question, we directly downloaded the corresponding Excel data from the [`WHO Global Health Expenditure Database (GHED)`](https://apps.who.int/nha/database/Select/Indicators/en) website. We then imported the Excel file using the `openxlsx` library and filtered the data for health expenditures of Albania as a percentage of GDP for the year 2005.
+
+```{r}
+# Read in the manually downloaded CSV-file
+df_who <- read.xlsx("../Data/GHED_all.xlsx")
+
+# From the documentation we now, that we are interested in the variable che_gdp for Albania in 2005
+df_who_alb <- round(df_who %>%
+  filter(code == "ALB",
+         year == "2005") %>%
+         select(che_gdp), 2)
+cat(paste0("The Health expenditures for Albania in 2005 from WHO are: ", df_who_alb$che_gdp, "%, and the value of the World Bank is ", exp_ALB$OBS_VALUE, "%."))
+
+```
+According to the WHO Data Explorer, the current health expenditure in Albania for 2005 amounts to **5.73% of GDP**. Our data retrieved from the World Bank also shows a value of **5.73% of GDP**. This perfect alignment confirms the accuracy of our API-based data retrieval and demonstrates that the World Bank figures are consistent with other authoritative data sources. The strong correspondence between both datasets increases **confidence in the plausibility and reliability** of our data, indicating that it can be used safely for further analysis.
+
+---
+
+#### Plausibility Check using Methodologies
+
+However, drawing a conclusion based on a single observation would be premature. Therefore, we took a closer look at the **methodologies** of both databases to understand why these values are consistent. Key findings from each source are summarized below:
+
+::: {.callout-note title="Methodology of WHO Global Health Expenditure Database (GHED)"}
+According to the `Methodology Documentation`, data in the GHED are collected directly from WHO Member States or estimated by the WHO in case of data gaps. The database is updated annually with data with 2 years lag (t-2).
+
+When consulting the `GHED Indicator List (2024)`, we see how the specific measures (such as Current Health Care Expenditures [CHE]) are computed. CHE is obtained by aggregating the following components:
+
+> Government schemes and compulsory contributory health care financing schemes (HF.1)<br> 
++ Voluntary health care payment schemes (HF.2)<br> 
++ Household out-of-pocket payment (HF.3)<br> 
++ Rest of the world financing schemes (non-resident) (HF.4)<br> 
++ Unspecified financing schemes (n.e.c.) (HF.nec)<br>
+
+Moreover, the `Methodology Documentation` states that the data series start from the year 2000 and follow the `System of Health Accounts 2011 (SHA 2011)` framework.
+:::
+
+::: {.callout-note title="Methodology of World Bank Health Expenditure Data"}
+From the World Bank we find the following information on the methodology:
+
+> The Health SHA 2011 tracks all health spending in a given country over a defined period of time regardless of the entity or institution that financed and managed that spending. It generates consistent and comprehensive data on health spending in a country, which in turn can contribute to evidence-based policy-making. Statistical concept(s): The health expenditure estimates have been prepared by the World Health Organization under the framework of the `System of Health Accounts 2011 (SHA 2011)`.
+
+:::
+
+In summary, the World Bank derives its health expenditure data directly from the WHO. This means both institutions use the **same methodological framework (SHA 2011)**, explaining why their reported values for Albania in 2005 are identical. From this perspective, differences between the two datasets should not exist, confirming the **consistency and integrity** of the data provided by both organizations.
+
+---
+
+## 1.2 Importing data on life expectancy and perceived health status for OECD countries
+
+*Our research question examines the relationship between health outcomes and investment in health. In the previous tasks, we retrieved data on investment in health. We now focus on retrieving data on life expectancy and perceived health status.*
+
+### 1.2.1 Life expectancy at birth indicator (from World Bank)
+
+*Import the life expectancy at birth indicator from the World Bank. Use your preferred method and present one solution. Explain the method in your own words and justify why you chose it. [3 pts]*
+
+#### Understanding Life Expectancy Data
+
+Before retrieving the data via our `API-function` we want to understand the definition and methodology of `life expectancy at birth (in years)`. Therefore, we first found the correct indicator. This was done, by first using the `data360/searchv2` interface on the World Bank API Website. The command directly executed on the webpage looked as follows:
+
+> { "count": true, "select": "series_description/idno, series_description/name, series_description/database_id", "search": "Life expectancy", "top": 10 }
+
+We got all indicators connected to **Life expectancy**. From all these indicators, we decided to work with the indicator `WB_WDI_SP_DYN_LE00_FE_IN` named **Life expectancy at birth, total (years)**.
+
+Consulting the documentation of this indicator we found the definition of **Life expectancy at birth**:
+
+> Life expectancy at birth indicates the number of years a newborn infant would live if prevailing patterns of mortality at the time of its birth were to stay the same throughout its life.
+
+Moreover, we found the source:
+
+> [United Nations Population Division; or derived from male and female life expectancy at birth from sources such as national statistical offices and Eurostat.](https://population.un.org/wpp/)
+
+... and the methodology:
+
+> Life expectancy at birth is derived from life tables and is based on sex- and age-specific death rates, or derived from male and female life expectancy at birth.
+
+The time coverage of the series is from 1960 to 2023.
+
+Since we only need to extract data for OECD countries, we examined the documentation in more detail. The `REF_AREA = "OED"` option provides only a weighted aggregate across all OECD countries, resulting in a single life expectancy value per year for the entire group. Therefore, we had to use a different approach.
+
+First, we identified all OECD member countries. Since several countries joined the OECD after 2000, we needed to decide which members to include:
+
+| Country         | Joined Year |
+|-----------------|-------------|
+| Slovak Republic | 2000        |
+| Chile           | 2010        |
+| Slovenia        | 2010        |
+| Israel          | 2010        |
+| Estonia         | 2010        |
+| Latvia          | 2016        |
+| Lithuania       | 2018        |
+| Colombia        | 2020        |
+| Costa Rica      | 2021        |
+
+We decided to include all 38 OECD countries to date. So in summary, we identified the appropriate World Bank indicator for life expectancy at birth (in years), examined its definition, source, and methodology, and determined that individual data for all 38 current OECD member countries must be retrieved instead of relying on the aggregated OECD value.
+
+---
+
+#### Getting Unique Country Codes
+
+In the next step, we retrieved the unique country codes for each OECD member, since the API requires these codes as input for `REF_AREA`parameter (to assure that we really select the correct countries). The corresponding procedure is shown below:
+
+```{r}
+# We define a function to retrieve the metadata for a specific Indicator
+get_indicator_metadata <- function(indicator_id = "WB_WDI_SP_DYN_LE00_IN"){
+  
+  # we use the paste0 methode to "construct" the URL based on the selected Indicator
+  base_url <- "https://data360api.worldbank.org/data360/metadata"
+  query <- paste0("?$filter=series_description/idno eq '", indicator_id, "'")
+
+  url <- paste0(base_url, query)
+  
+  # define request (POST)
+  req <- request(base_url) %>%
+    req_method("POST") %>% 
+    req_body_json(list(query = paste0("&$filter=series_description/idno eq '", indicator_id, "'")))
+  
+  # send request
+  resp <- req_perform(req)
+  
+  # if request is not successful return error message
+  if (resp_status(resp) != 200){
+    message("The request was not successful")
+  }
+  else{
+    return(resp_body_json(resp))
+  }
+}
+```
+
+We can now use our indicator to retrieve the metadata as a JSON-file.
+
+```{r}
+metadata_life_exp <- get_indicator_metadata(indicator_id = "WB_WDI_SP_DYN_LE00_IN")
+```
+
+After examining the structure of the JSON-file, we can now extract all countries along with their corresponding codes.
+
+```{r}
+# extracting all countries of the JSON-file
+countries <- metadata_life_exp$value[[1]]$series_description$ref_country
+# Convert into a dataframe
+df_countries <- map_dfr(countries, as.data.frame)
+
+# check column names
+head(df_countries, 3)
+```
+
+Let' now retrieve the unique country codes for each of the 38 OECD countries. We have manually extracted them from the **World Bank Website**.
+
+```{r}
+# manually defined list of OECD countries (in capital letters)
+oecd_countries_upper <- c(
+  "AUSTRALIA", "AUSTRIA", "BELGIUM", "CANADA", "CHILE", "COLOMBIA",
+  "COSTA RICA", "CZECHIA", "DENMARK", "ESTONIA", "FINLAND", "FRANCE",
+  "GERMANY", "GREECE", "HUNGARY", "ICELAND", "IRELAND", "ISRAEL",
+  "ITALY", "JAPAN", "KOREA, REP.", "LATVIA", "LITHUANIA", "LUXEMBOURG",
+  "MEXICO", "NETHERLANDS", "NEW ZEALAND", "NORWAY", "POLAND", "PORTUGAL",
+  "SLOVAK REPUBLIC", "SLOVENIA", "SPAIN", "SWEDEN", "SWITZERLAND",
+  "TÜRKIYE", "UNITED KINGDOM", "UNITED STATES"
+)
+
+# bring them into the same format as df_countries$name
+oecd_countries <- stringr::str_to_title(tolower(oecd_countries_upper))
+
+# # We used the code line below to check, wether all 38 countries are contained in both lists
+# # We figured out, that Turkiye must be written with "ü" in our country list
+# setdiff(oecd_countries, df_countries$name)
+
+# filter df_countries
+df_oecd <- df_countries %>%
+  filter(name %in% oecd_countries)
+
+# define a vector with the specific country codes
+ref_area_oecd <- df_oecd$code
+ref_area_oecd
+```
+
+---
+
+#### Importing life expectancy at birth indicator from World Bank 
+
+Now we are ready to retrieve the data for all OECD countries with our `get_all_data` function.
+
+```{r}
+#| message: true
+# retrieve dataframe for life expectancy (in years) of OECD countries from World Bank (WB)
+df_oecd_life_exp_WB <- get_all_data(
+  indicator = "WB_WDI_SP_DYN_LE00_IN",
+  ref_area = ref_area_oecd,
+  start_year = "2000",
+  end_year = "2023"
+)
+
+skim(df_oecd_life_exp_WB)
+
+```
+
+::: {.callout-important title="Short Check"}
+We have 24 years x 38 countries = 912 entries. This corresponds to the number of observations we have retrieved.
+:::
+
+---
+
+#### Plausibility Check for retrieved Data
+
+We can even briefly check, which of the OECD countries has the largest Life Expectancy in years by using the `group_by` function of `dplyr`:
+
+```{r}
+df_oecd_life_exp_WB_summary <- df_oecd_life_exp_WB %>%
+  group_by(REF_AREA) %>%
+  summarise(
+    MEAN_OBS_VALUE = mean(OBS_VALUE, na.rm = TRUE)
+  ) %>%
+  arrange(desc(MEAN_OBS_VALUE))
+
+# find the highest and lowest value with slice_xx() function of dplyr
+highest <- df_oecd_life_exp_WB_summary %>% slice_max(MEAN_OBS_VALUE, n = 1)
+lowest <- df_oecd_life_exp_WB_summary %>% slice_min(MEAN_OBS_VALUE, n = 1)
+
+# paste the output text together
+summary_text <- paste0(
+  "The OECD country with the highest life expectancy is ",
+  highest$REF_AREA, " with an average of ",
+  round(highest$MEAN_OBS_VALUE, 2), " years, while ",
+  lowest$REF_AREA, " has the lowest average life expectancy (",
+  round(lowest$MEAN_OBS_VALUE, 2),
+  " years) over the period 2000 to 2023."
+)
+
+# print it as text in the Quarto Notebook
+cat(summary_text)
+```
+
+A quick plausibility check confirms that the retrieved data are reasonable, as Japan shows the highest average life expectancy (83.05 years) and Latvia the lowest (73.12 years) among OECD countries between 2000 and 2023, consistent with known demographic patterns.
+
+---
+
+#### Explaining Our Method and Why We chose it
+
+To retrieve the indicator **Life expectancy at birth (years)** for all OECD countries, we adopted our custom R function that uses the **World Bank Data360 API** (adding `REF_AREA` as an input variable and add `.multi = "comma"` so we can handle a vector to create the URL). The function allows for flexible data extraction by specific key parameters such as the indicator, country codes, and time range.
+
+The function `get_all_data()` dynamically constructs an API request URL and retrieves the data in JSON format. It uses the `httr2` package, which provides a modern and readable syntax for HTTP requests. Since the API only returns a limited number of records per request, a loop structure (`repeat`) is used to iteratively fetch the data in batches of 1'000 observations until no further records are available. Each batch is stored in a list and later combined into a single dataframe.
+
+The function also includes basic error handling. It checks whether the API call was successful (status code 200) and stops if no additional data are available. After downloading, the JSON response is flattened and relevant numeric columns (e.g. `OBS_VALUE`, `TIME_PERIOD`) are converted to the correct data types.
+
+Since we could only retrieve an aggregated value of OECD countries, we first created a list of all OECD member states and filtered their corresponding codes from the World Bank metadata (the `df_countries` dataframe). These codes were then passed to the `ref_area` parameter of the function.
+
+We used this method because it is **fully reproducible, flexible, and scalable** (as already described in section 1.1.1). It allows the extraction of any indicator from the World Bank database directly into R, without the need for manual downloads or external tools. The code can easily be adapted to retrieve other variables or country groups simply by changing the function parameters. Moreover, the `httr2` approach provides transparency and fine control over the API request, which is especially useful when working with large datasets or when integrating automated data updates.
+
+---
+
+### 1.2.2 Perceived Health Status
+
+*Retrieve the indicators on life expectancy and perceived health status from the OECD Data Explorer. You may need to select specific data before importing, or you can import the full dataset.*
+
+*Use your preferred method to retrieve the data and, if you made any data selection before importing, explain your reasoning. Present one solution. [5 pts]*
+
+#### Understanding Perceived Health Status Data
+
+Before importing this data, we want to understand what the data really means.
+
+::: {.callout-note title="Definition **Perceived Health Status**"}
+This dataset presents data on perceived health status (percentage of the population, aged 15 years old and over who report their health to be ‘good/very good' (or excellent) (all positive response categories), ‘fair’ (not good, not bad), ‘bad/very bad’ (all negative response categories).
+:::
+
+---
+
+#### Preselection of Data
+
+Since there are **16,131** datapoints, we first want to preselect the data we want to use and briefly explain the method we use to retrieve the data.
+
+The data selection was deliberately restricted to **OECD member countries** to maintain comparability with earlier analyses based on OECD data (Life expectancy). This approach ensures a consistent analytical framework and minimizes potential bias caused by differences in data collection standards between OECD and non-OECD countries.
+
+We selected the **time period from 2000 to 2023** to align with the temporal scope used in our previous datasets. In addition, we filtered by several key dimensions to obtain meaningful and interpretable subsets of the data:
+
+-   **Age groups:** We included all possible age groups in our data. This allows age-specific comparisons while still providing an overall population reference.
+
+-   **Sex:** We included the total (_T) to enable overall analyses. Nevertheless, we can easily change that to conduct gender-based analyses.
+
+-   **Health status dimension:** The selection included G (good/very good), B (bad/very bad) and F (fair). Including all three ensures a comprehensive view across different health metrics.
+
+---
+
+#### Importing Perceived Health Status and Explaining Our Preferred Method
+
+We used the dataset `DSD_HEALTH_STAT@DF_PHS` from the `OECD SDMX REST API` (version 1). Data were retrieved directly through the API endpoint `https://sdmx.oecd.org/public/rest/data/`, ensuring that the results are reproducible and that the latest available version of the dataset is used.
+
+Furthermore, we specified the query parameter `dimensionAtObservation = TIME_PERIOD`, which groups observations into time series (since our data had a Time Period dimension). This is also the first prioritized default value according to the documentation. Therefore, the naive import by directly calling the final URL leads to the same result, even tough `dimensionsAtObservation = "AllObservations"`. Important was as well to set `detail = dataonly` to exclude attributes. This was useful to get a better overview of the JSON-file.
+
+
+```{r}
+get_oecd_data <- function(
+    agency_id = "OECD.ELS.HD", 
+    dataset_id = "DSD_HEALTH_STAT@DF_PHS",
+    dataset_version = "1.1",
+    ref_area = NULL, # e.g. c("AUS", "AUT", "BEL")
+    unit_of_measure = NULL, # e.g. "A.." or "A.LFEXP"
+    age = NULL, # e.g. c("Y15T24","Y25T44")
+    sex = NULL, # e.g. c("M","F","_T")
+    health_status = NULL, # for extra dimensions
+    start = "2000",
+    end = "2023",
+    dimAtObservation = "AllDimensions",
+    format = "jsondata",
+    detail = "DataOnly") {
+  
+  base_url = "https://sdmx.oecd.org/public/rest/data"
+  
+  # --- Helper function to collapse dimension values ---
+  collapse_dim <- function(x) {
+    if (is.null(x)) return("")       # if missing, just empty
+    paste(x, collapse = "+")         # join by "+"
+  }
+  
+  # --- 1. Build the "data_selection" part ---
+  # Each dimension separated by a "."
+  # If any dimension is missing -> leave empty but keep dot placeholders
+  ref_str <- collapse_dim(ref_area)
+  age_str <- collapse_dim(age)
+  sex_str <- collapse_dim(sex)
+  health_str <- collapse_dim(health_status)
+  
+  # Build the core data selection string
+  # This order can easily be adjusted if OECD changes the dataset's structure.
+  data_selection <- paste(ref_str, unit_of_measure, age_str, sex_str, health_str, sep = ".")
+  
+  # --- 2. Construct the full path ---
+  full_path <- paste0(
+    agency_id, ",",
+    dataset_id, ",",
+    dataset_version, "/",
+    data_selection
+  )
+  
+  # --- 3. Build the request ---
+  req <- request(base_url) %>%
+    req_url_path_append(full_path) %>%
+    req_url_query(
+      startPeriod = start,
+      endPeriod = end,
+      dimensionAtObservation = dimAtObservation,
+      format = format,
+      detail = detail
+    )
+  
+  # --- 4. Perform the request ---
+  resp <- req_perform(req)
+  
+  # --- 5. Check if successful ---
+  if (resp_status(resp) != 200) {
+    message("The request was not successful. Status: ", resp_status(resp))
+    break
+  }
+  
+  # --- 6. Parse and return JSON ---
+  data_json <- resp_body_json(resp)
+  return(data_json)
+}
+
+```
+
+```{r}
+json_oecd_healthstat <- get_oecd_data(
+  agency_id = "OECD.ELS.HD",
+  dataset_id = "DSD_HEALTH_STAT@DF_PHS",
+  dataset_version = "1.1",
+  ref_area = c("AUS","AUT","BEL","CAN","CHL","COL","CRI","CZE","DNK","EST",
+               "FIN","FRA","DEU","GRC","HUN","ISL","IRL","ISR","ITA","JPN",
+               "KOR","LVA","LTU","LUX","MEX","NLD","NZL","NOR","POL","PRT",
+               "SVK","SVN","ESP","SWE","CHE","TUR","GBR","USA"),
+  unit_of_measure = "A..",
+  age = c("Y15T24","Y25T44","Y45T64","Y_GE65","Y_GE15"),
+  sex = "_T....",
+  health_status = c("F","B","G.."),
+  start = "2000",
+  end = "2023",
+  dimAtObservation = "TIME_PERIOD",
+  format = "jsondata",
+  detail = "dataonly"
+)
+```
+
+After consulting the JSON-file, we quickly found out, that the JSON-structure is quite complicated. Therefore, with a little help from ChatGPT we were able to build a parse function to transform the data from the JSON-file into a dataframe.
+
+```{r}
+parse_oecd_json <- function(oecd_json){
+  
+  # retrieve the main parts of the JSON file
+  data_sets <- oecd_json$data$dataSets[[1]]$series
+  series_dims <- oecd_json$data$structures[[1]]$dimensions$series
+  obs_dims <- oecd_json$data$structures[[1]]$dimensions$observation[[1]]$values
+  
+  # extract dimension names and values for series
+  dim_names <- map_chr(series_dims, "id")
+  dim_values <- map(series_dims, function(d) map_chr(d$values, "id"))
+  names(dim_values) <- dim_names
+  
+  # extract TIME_PERIOD values
+  time_periods <- map_chr(obs_dims, "id")
+  
+  # iterate over all series
+  df_list <- imap_dfr(data_sets, function(serie, key){
+    # split key (e.g. "0:1:0:3:...") in numbers
+    key_split <- as.integer(strsplit(key, ":", fixed = TRUE)[[1]])
+    
+    # extract actual dim-values
+    dim_combo <- map2_chr(dim_values, key_split, function(vals, idx) vals[idx+1])
+    names(dim_combo) <- dim_names
+    
+    # extract observations (TIME_PERIOD + VALUE)
+    obs <- serie$observations
+    if (length(obs) == 0) return(NULL)
+    
+    obs_df <- imap_dfr(obs, function(val, obs_key){
+      obs_index <- as.integer(obs_key) + 1
+      time_val <- if(!is.na(obs_index) && obs_index <= length(time_periods)){
+        time_periods[obs_index]
+      } else {
+        NA
+      }
+      
+      tibble(
+        TIME_PERIOD = as.integer(time_val),
+        VALUE = val[[1]]
+      )
+    })
+    
+    # add dimension values
+    cbind(as_tibble(as.list(dim_combo)), obs_df)
+  })
+  
+  return(df_list)
+}
+```
+
+We can now use this parse function to create our dataframe:
+
+```{r}
+df_oecd_healthstat <- parse_oecd_json(json_oecd_healthstat)
+```
+
+#### Plausibility Check
+
+Since this was quite challenging, we want to briefly check, whether our data frame is similar to the one we directly retrieve by using the final URL directly and choose `format=csvfile`.
+
+```{r}
+base_url <- "https://sdmx.oecd.org/public/rest/data/OECD.ELS.HD,DSD_HEALTH_STAT@DF_PHS,1.1/AUS+AUT+BEL+CAN+CHL+COL+CRI+CZE+DNK+EST+FIN+FRA+DEU+GRC+HUN+ISL+IRL+ISR+ITA+JPN+KOR+LVA+LTU+LUX+MEX+NLD+NZL+NOR+POL+PRT+SVK+SVN+ESP+SWE+CHE+TUR+GBR+USA.A...Y15T24+Y25T44+Y45T64+Y_GE65+Y_GE15._T.....F+B+G..?startPeriod=2000&endPeriod=2023&dimensionAtObservation=AllDimensions&format=csvfile"
+
+df_oecd_healthstat_csv <- read.csv(base_url)
+```
+
+First, look if we got the same number of observations:
+
+- In the OECD Perceived Health Status dataset using API we got `r nrow(df_oecd_healthstat)` observations
+- In the OECD Perceived Health Status dataset using the final URL we got `r nrow(df_oecd_healthstat_csv)` observations
+
+And indeed, the length of our dataframes are equal.
+
+But next, we want to look at the distribution of the `VALUE`/`OBS_VALUE` in both datasets:
+
+```{r}
+df_long <- bind_rows(
+  df_oecd_healthstat %>%
+    select(value = VALUE) %>%
+    mutate(source = "API (OBS_VALUE)"),
+  df_oecd_healthstat_csv %>%
+    select(value = OBS_VALUE) %>%
+    mutate(source = "CSV (VALUE)")
+)
+
+ggplot(df_long, aes(x = value, fill = source, color = source)) +
+  geom_density(alpha = 0.4, linewidth = 0.8) +
+  theme_minimal() +
+  labs(
+    title = "Distribution Comparison: API vs. CSV Data",
+    subtitle = "Both should overlap perfectly if the values are identical",
+    x = "Perceived Health Status",
+    y = "Density",
+    fill = "Data Source",
+    color = "Data Source"
+  )
+
+```
+
+To complete our plausibility check, we check if the considered values `VALUE`/`OBS_VALUE` in both dataframes are equal, we can use the function `identical`, which tests objects for exact equality:
+
+```{r}
+identical(df_oecd_healthstat$VALUE, df_oecd_healthstat_csv$OBS_VALUE)
+```
+
+So overall, the density plot shows a complete overlap between the API and CSV datasets, which we confirmed by using the `identical()` function. This visual confirmation supports the numerical equality check and validates that the data retrieval methods produce consistent results.
+
+---
+
+#### Importing Life Expectancy Data (from OECD Data Explorer)
+
+Given the confidence about our approach we got, we will import now the data on life expectancy from the OECD Data API. Here, we can finally make use of the functions we developed above (because we have invested lots of time in coding these. This process required a solid understanding of the JSON structure, API logic, and the differences between **query-based URLs** (e.g. World Bank -> ...?REF_AREA=AUS,BEL,...) and **path-based URL structures** (eg. OECD Data -> /agency_id,datset_id,...))
+
+In the `OECD Data Explorer` we identified a dataset called **Life expectancy** (52,277 unfiltered datapoints) covering the dimensions *Reference area*, *Measure*, *Age*, *Sex* and *Time period*. We also found a second dataset, **Helath Status** (1,447,985 unfiltered datapoints), which includes additional dimensions such as *Unit of measure, Socio-economic status, Cause of death, Calculation methodology, Gestation period threshold, Health status, Disease, Cancer site*. Although these additional dimensions are not selectable in the Data Explorer, we chose to use this second dataset (`DSD_HEALTH_STAT@DF_HEALTH_STATUS`) because it also provides life expectancy as the unit of measure and yields the same number of observations (909) for our selection.
+
+::: {.callout-note title="Definition of the Dataset"}
+This dataset presents core population health indicators, covering life expectancy; mortality indicators such as causes of mortality (by ICD codes), maternal and infant mortality, avoidable (preventable + treatable) mortality; potential years of life lost; perceived health status (also disaggregated by socio-economic status and education level); low birthweight; incidence of key communicable diseases; cancer incidence; injuries in road traffic accidents; and sickness absences from work.
+:::
+
+As described above, we retrieved the **Life Expectancy** data from the `OECD SDMX REST API` (version 1) using the custom functions defined earlier. This approach ensures reproducibility and provides structured, up-to-date data directly from the source.
+
+Our data selection was restricted to **OECD member countries**, to maintain consistency with previous data imports. The **time period 2000-20003** was chosen to align with the time frame used throughout the project. For the indicators, we used `A.LFEXP` (life expectancy) and selected specific **age groups** (`Y0`, `Y40`, `Y60`, `Y65`, `Y80`). Note that these age groups vary compared to the previous datasets (where a range was given). We restricted the **sex dimension** to totals (`_T....`) aligning with our previous data retrievals.
+
+The request returned data in **JSON format** with `detail = "dataonly"` to simplify parsing of the JSON-file. The observations were grouped by `dimensionAtObservation = "TIME_PERIOD"`, resulting in a tidy time-series dataset for each country.
+
+Overall, the dimension structure was preserved, allowing us to reuse the defined functions from above to retrieve the JSON-file and parsing it into a dataframe.
+
+```{r}
+json_oecd_life_exp <- get_oecd_data(
+  agency_id = "OECD.ELS.HD",
+  dataset_id = "DSD_HEALTH_STAT@DF_HEALTH_STATUS",
+  dataset_version = "1.1",
+  ref_area = c("AUS","AUT","BEL","CAN","CHL","COL","CRI","CZE","DNK","EST",
+               "FIN","FRA","DEU","GRC","HUN","ISL","IRL","ISR","ITA","JPN",
+               "KOR","LVA","LTU","LUX","MEX","NLD","NZL","NOR","POL","PRT",
+               "SVK","SVN","ESP","SWE","CHE","TUR","GBR","USA"),
+  unit_of_measure = "A.LFEXP",
+  age = c("Y.Y40","Y60","Y65","Y80","Y0"),
+  sex = "_T......",
+  health_status = NULL,
+  start = "2000",
+  end = "2023",
+  dimAtObservation = "TIME_PERIOD",
+  format = "jsondata",
+  detail = "dataonly"
+)
+```
+
+
+We can now parse the imported JSON-file with the same `parse_oecd_json` function we have build above.
+
+```{r}
+df_oecd_life_exp <- parse_oecd_json(json_oecd_life_exp)
+
+summary(df_oecd_life_exp)
+```
+
+We again check whether our resulted data is correct and we conclude with the same steps described above that this is the case:
+
+```{r}
+base_url <- "https://sdmx.oecd.org/public/rest/data/OECD.ELS.HD,DSD_HEALTH_STAT@DF_LE,1.1/AUS+AUT+BEL+CAN+CHL+COL+CRI+CZE+DNK+EST+FIN+FRA+DEU+GRC+HUN+ISL+IRL+ISR+ITA+JPN+KOR+LVA+LTU+LUX+MEX+NLD+NZL+NOR+POL+PRT+SVK+SVN+ESP+SWE+CHE+TUR+GBR+USA.A.LFEXP..Y40+Y60+Y65+Y80+Y0._T.......?startPeriod=2000&endPeriod=2023&dimensionAtObservation=AllDimensions&format=csvfile"
+
+df_oecd_life_exp_csv <- read.csv(base_url)
+summary(df_oecd_life_exp_csv)
+```
+
+:::{.callout-important}
+Note that the number of rows directly retrieved from `OECD` (909) varies compared to the life expectancy we have retrieved from `World Bank` (912). When working with these data, we should first figure out the reason for this deviation.
+:::
+
+---
+
+## 1.3 First data exploration
+
+*In his book Statistics for Public Policy, Jeremy G. Weber argues that one of the most important steps in working with data is… to know your data. By this, he means understanding key characteristics of the dataset. He highlights three essential aspects:*
+
+*1. Know the definitions (for example, how is perceived health status defined?)*
+
+*2. Know the units (for example, are things measured in Euros, Swiss francs, or USD?)*
+
+*3. Know the quality of your data. Conduct simple “smell tests” on key variables.*
+
+*We can add two additional aspects:*
+
+*4. Know the unit of observation (are the units we are observing countries, groups of countries, continents?)*
+
+*5. Know the time structure (are we observing the same unit repeatedly over time, as in a panel, or different units at different times, as in a cross‐section?)*
+
+*Now explore the data frames you have imported.*
+
+---
+
+### 1.3.1 Content of your data
+
+*Briefly describe the content of each dataset according to the five key aspects described above [8 pts].*
+
+Since we have also imported datasets for control purposes, we first want to give a brief overview of the main datasets that we have imported (without these additional datasets):
+
+| Section | Source | Content | Variable name | Import method | Country |
+|:--------:|:---------|:----------------------|:---------|:---------|:---------|
+| 1.1.1 | World Bank | Current health expenditure per capita (in current US\$) | `df_exppc_all` | API (JSON) | all |
+| 1.1.1 | World Bank | Current health expenditure (% of GDP) | `df_exp_all` | API (JSON) | all |
+| 1.1.3 | WHO GHED | Current health expenditure (multiple measures) | `df_who` | manual (xlsx) | all |
+| 1.2.1 | World Bank | Life expectancy at birth (in years) | `df_oecd_life_exp_WB` | API (JSON) | OECD |
+| 1.2.2 | OECD | Perceived health status (% of population) | `df_oecd_healthstat` | API (JSON) | OECD |
+| 1.2.2 | OECD | Life expectancy (in years) | `df_oecd_life_exp` | API (JSON) | OECD |
+
+We will now discuss the five criteria for each of the five datasets (`df_who`excluded).
+
+:::{.callout-note}
+The dataset `df_who` is not mandatory, since exercise 1.1.3 only asked to check Albanias health expenditures in 2005 via the WHO Data Explorer interface.<br> Moreover, some criteria were already mentioned in the corresponding section. Nevertheless, these points will be repeated in this section...
+:::
+
+---
+
+#### 1. Know the definitions
+
+##### Current Health Expenditure per Capita (in current US\$)
+
+To get the definition of **current health expenditure per capita (in current US$)** we used the `Data360 API` of the World Bank. Specifically, with `data360/metadata` one can retrieve all attributes of a specific indicator. Hence, our query call looked as follows:
+
+> { "query": "&\$filter=series_description/idno eq 'WB_WDI_SH_XPD_CHEX_PC_CD'" }
+
+::: {.callout-note title="Definition of `Current health expenditure per capita`"}
+Current expenditures on health per capita in current US dollars. Estimates of current health expenditures include healthcare goods and services consumed during each year.
+:::
+
+::: {.callout-note title="Methodology"}
+The Health SHA 2011 tracks all health spending in a given country over a defined period of time regardless of the entity or institution that financed and managed that spending. It generates consistent and comprehensive data on health spending in a country, which in turn can contribute to evidence-based policy-making.
+:::
+
+---
+
+##### Current Health Expenditure (% of GDP)
+
+We used the same approach as with `df_exppc_all`, but now using the indicator `WB_WDI_SH_XPD_CHEX_GD_ZS`. Here are the results:
+
+::: {.callout-note title="Definition of `Current health expenditure (% of GDP)`"}
+Level of current health expenditure expressed as a percentage of GDP. Estimates of current health expenditures include healthcare goods and services consumed during each year. This indicator does not include capital health expenditures such as buildings, machinery, IT and stocks of vaccines for emergency or outbreaks.
+:::
+
+Note that this definition varies compared to the previous one. We have one additional sentence indicating, that capital health expenditures are excluded.
+
+::: {.callout-note title="Methodology"}
+The Health SHA 2011 tracks all health spending in a given country over a defined period of time regardless of the entity or institution that financed and managed that spending. It generates consistent and comprehensive data on health spending in a country, which in turn can contribute to evidence-based policy-making.
+:::
+
+However, the high-level methodology is identical to the previous dataframe. And from section [1.1.3 Plausibility checks](#113-plausibility-check) we already now that the World Bank gets the data from the WHO. So, please check out this section to get a more detailed overview on the methodology.
+
+---
+
+##### Life Expectancy at Birth in Years (World Bank)
+
+We already described in [section 1.2.1](121-life_expectancy-at-birth-indicator) how we retrieved the definition and methodology of the indicator **Life expectancy at birth, total (years)** (see this section for further information on the dataset). Nevertheless we will repeat them briefly here:
+
+::: {.callout-note title="Definition Life expectancy at birth"}
+Life expectancy at birth indicates the number of years a newborn infant would live if prevailing patterns of mortality at the time of its birth were to stay the same throughout its life.
+:::
+
+::: {.callout-note title="Methodology of Current health expenditure (% of GDP)"}
+Life expectancy at birth is derived from life tables and is based on sex- and age-specific death rates, or derived from male and female life expectancy at birth.
+:::
+
+---
+
+##### Perceived Health Status (% of Population)
+
+Again the definition of **Perceived Health Status** (see [section 1.2.2](122-perceived-health-status)).
+
+::: {.callout-note title="Definition Perceived Health Status"}
+This dataset presents data on perceived health status (percentage of the population, aged 15 years old and over who report their health to be ‘good/very good' (or excellent) (all positive response categories), ‘fair’ (not good, not bad), ‘bad/very bad’ (all negative response categories).
+:::
+
+Furthermore, by downloading the documentation of the OECD Website, we find a brief overview of the methodology:
+
+::: {.callout-note title="Methodology of Perceived Health Status"}
+There is not yet full standardisation of the measurement of perceived health status across OECD countries. In Europe, a standard health interview survey instrument has been recommended to measure this variable.
+:::
+
+---
+
+##### Life Expectancy in Years (OECD Data Explorer)
+
+We also downloaded the documentation of the specific query as a pdf from the Website and found the following:
+
+::: {.callout-note title="Definition of Life Expectancy"}
+Life expectancy at birth and at ages 40, 60, 65 and 80 years old is the average number of years that a person at that age can be expected to live, assuming that age-specific mortality levels remain constant.
+:::
+
+And here a quick overview of the methodology. However, these vary again by country:
+
+::: {.callout-note title="Methodology of Life Expectancy"}
+Life expectancy at birth for the total population is no longer estimated by the OECD Secretariat (using the unweighted average of life expectancy of men and women), but either extracted from the Eurostat database for European countries, or directly provided by other countries.
+:::
+
+---
+
+#### 2. Know the units 
+
+```{r}
+# first create a list of all datasets
+datasets <- list(
+  df_exppc_all = df_exppc_all,
+  df_exp_all = df_exp_all,
+  df_oecd_life_exp_WB = df_oecd_life_exp_WB,
+  df_oecd_healthstat = df_oecd_healthstat,
+  df_oecd_life_exp = df_oecd_life_exp
+)
+
+
+iwalk(datasets, function(df, name) {
+  return(cat(paste0("The Unit measure of ", name, " is: ", unique(df$UNIT_MEASURE), ".\n")))
+})
+```
+
+:::{.callout-note title="Clarification of the Output"}
+For `df_exp_all` *PT_GDP* means **health expenditure in percentage of GDP**.<br>
+For `df_life_exp` and `df_oecd_life_exp` we have **years**.<br>
+And from *section 1.2.2* we know that for dataframe `df_oecd_healthstat` *PT_POP_AGE* means **percentage of the population of a specific age group that report their health to be ‘good/very good' (or excellent) (all positive response categories), ‘fair’ (not good, not bad), ‘bad/very bad’ (all negative response categories)**.
+:::
+
+---
+
+#### 3. Know the quality of your data (conduct simple “smell tests”)
+
+##### Overview
+
+We decided to write a few functions to conduct these "smell tests". Here is a brief description of the functions:
+
+- `smell_test_summary`: Gives a brief stasticical overview of each dataset grouped by the **REF_AREA** (country/region). We can also check in the dataframe output if we have missing values for a specific country.
+
+- `plot_obs_ref_area`: Boxplots showing the distribution of the **OBS_VALUE** for each **REF_AREA**. These plots are nice for the datasets that consist of the 38 OECD countries. The Boxplots for the other datasets are hard to read, since we have to many countries. Nevertheless, they give us an indication of the number of outliers. For further analysis it is important to check these outliers and decide how to handle them. Moreover, we can already see a wide distribution of the measures (OBS_VALUES) between our countries.
+
+- `plot_obs_time`: Boxplots showing the distribution of the **OBS_VALUE** for each **TIME_PERIOD** (in our case = Years). This boxplots are nice to see the trends of our dataframes.
+
+---
+
+##### First Smell Test
+
+###### Create the function
+
+```{r}
+smell_test_summary <- function(df, ref_col = "REF_AREA", value_col = "OBS_VALUE") {
+  df %>%
+    group_by(.data[[ref_col]]) %>%
+    summarise(
+      n_total = n(),
+      n_missing = sum(is.na(.data[[value_col]])),
+      n_valid = sum(!is.na(.data[[value_col]])),
+      mean_value = mean(.data[[value_col]], na.rm = TRUE),
+      median_valua = median(.data[[value_col]], na.rm = TRUE),
+      min_value = min(.data[[value_col]], na.rm = TRUE),
+      max_value = max(.data[[value_col]], na.rm = TRUE),
+      sd_value = sd(.data[[value_col]], na.rm = TRUE),
+      iqr_value = IQR(.data[[value_col]], na.rm = TRUE)
+    ) %>%
+    arrange(desc(n_missing)) # first show countries with most missing values
+}
+```
+
+---
+
+###### Current Health Expenditure per Capita (in current US\$)
+
+```{r}
+smell_test_summary(df_exppc_all, ref_col = "REF_AREA", value_col = "OBS_VALUE")
+```
+
+We see that we don't have any missing values in this dataset for OBS_VALUE. Furthermore, this dataset consists of 240 countries/regions. Because of the large scope, we will not dive deeper into statistics right now. However, we might return to this dataframe for the Part 2 of the Assignment where we conduct analysis.
+
+---
+
+###### Current Health Expenditure (% of GDP)
+
+```{r}
+smell_test_summary(df_exp_all, ref_col = "REF_AREA", value_col = "OBS_VALUE")
+```
+
+Also in the dataset on **Current health expenditure (% of GDP)** we have no missing values. Again, we are dealing with 240 countries. Already the first five countries of the dataset show a big difference comparing their mean. In Afghanistan we can further see a large distribution across the country (see sd_value). As in the previous dataset, we might return to this statistical summary of the dataset when conducting deeper analysis in Assignment Part 2.
+
+---
+
+###### Life Expectancy at Birth in Years (World Bank)
+
+```{r}
+smell_test_summary(df_oecd_life_exp_WB, ref_col = "REF_AREA", value_col = "OBS_VALUE")
+```
+
+Now we are only dealing with the 38 OECD countries and their **Life expectancy at birth, total (years)**. Again, no missing data of the observed value.
+
+---
+
+###### Perceived Health Status (% of Population)
+
+```{r}
+smell_test_summary(df_oecd_healthstat, ref_col = "REF_AREA", value_col = "VALUE")
+```
+
+For **Perceived Health Status** we have no missing data. However, a large difference in number of observations between the 38 OECD countries. 
+
+:::{.callout-important}
+For the perceived Health Status, our Boxplots aren't very useful. We have seen that the measure of the Perceived Health Status is collected based on a survey. Three classes are then build. Therefore, we have a second dimension in our dataset, which makes these boxplots not very useful. This is also an important point to mention for the other dataset, where we e.g. have the dimension of age. We ignored this aspect up till now. Nevertheless, we also show the boxplots for Perceived Health Status without further comments. This should also demonstrate the uselesness of these plots :). For the second boxplot, we will modify the functions input and use `HEALTH_STATUS` on the x-axes. We might get a more interesting result. But also with this plot we ignore the aspect that we are dealing with different age groups.
+:::
+
+---
+
+###### Life Expectancy in Years (OECD Data Explorer)
+
+```{r}
+smell_test_summary(df_oecd_life_exp, ref_col = "REF_AREA", value_col = "VALUE")
+```
+
+For **Life expectancy at birth and at ages 40, 60, 65 and 80 years old** we have no missing values.
+
+---
+
+##### Second Smell Test
+
+###### Create the function
+
+```{r}
+plot_obs_ref_area <- function(df, dataset_name = "Insert Name", value_col = "OBS_VALUE", ref_col = "REF_AREA") {
+  # clean df from NaN's to receive a nice plot
+  df_clean <- df %>%
+    filter(!is.na(.data[[value_col]]), !is.na(.data[[ref_col]])) #%>%
+    #mutate({{ref_col}} := as.character(.data[[ref_col]])) # treat time period as categorical
+
+  # create boxplot
+  ggplot(df_clean, aes(x = .data[[ref_col]], y = .data[[value_col]])) +
+    geom_boxplot(fill = "steelblue", alpha = 0.7, outlier.color = "red") +
+    labs(
+      title = paste("Distribution", dataset_name, "over country/region"),
+      y = df$UNIT_MEASURE,
+      x = ref_col
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.x = element_text(angle = 60, hjust = 1),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_blank()
+    )
+}
+```
+
+---
+
+######  Current Health Expenditure per Capita (in current US\$)
+
+```{r}
+plot_obs_ref_area(df_exppc_all, dataset_name = "df_exppc_all")
+```
+
+Of course this plot is not really nice. But it shows that we have multiple outliers. Further, and more detailed analysis is necessary, if we have to work with this dataframe.
+
+---
+
+###### Current Health Expenditure (% of GDP)
+
+```{r}
+plot_obs_ref_area(df_exp_all, dataset_name = "df_exp_all")
+```
+
+On a first sight, this data consists of more outliers in each country/region compared to the previous dataset. Moreover, the distribution of health expenditure in % of GDP across countries is even stronger compared to plot from the previous dataset.
+
+---
+
+###### Life Expectancy at Birth in Years (World Bank)
+
+```{r}
+plot_obs_ref_area(df_oecd_life_exp_WB, dataset_name = "df_oecd_life_exp_WB")
+```
+
+We see 2 outliers for Mexico. Colombia or Estonia have a lower average life expectancy at birth, while countries like Japan or Switzerland (CHE) have a high median life expectancy of around 83 years.
+
+---
+
+###### Perceived Health Status (% of Population)
+
+```{r}
+plot_obs_ref_area(df_oecd_healthstat, dataset_name = "df_oecd_healthstat", value_col = "VALUE")
+```
+---
+
+###### Life Expectancy in Years (OECD Data Explorer)
+
+```{r}
+plot_obs_ref_area(df_oecd_life_exp, dataset_name = "df_oecd_life_exp", value_col = "VALUE")
+```
+
+We see this same outlier as with the Life Expectancy from the `World Bank` data for Mexico. Otherwise, the overall picture is similiar to the one from the world bank. But we already detected some differences, e.g. for Mexico the IQR is smaller. We might return to this discussion in the second part of the Assignment.
+
+---
+
+##### Third Smell Test
+
+###### Create the function
+
+```{r}
+plot_obs_time <- function(df, dataset_name = "Insert Name", value_col = "OBS_VALUE", time_col = "TIME_PERIOD") {
+  # clean df from NaN's to receive a nice plot
+  df_clean <- df %>%
+    filter(!is.na(.data[[value_col]]), !is.na(.data[[time_col]])) %>%
+    mutate({{time_col}} := as.factor(.data[[time_col]])) # treat time period as categorical
+
+  # create boxplot
+  ggplot(df_clean, aes(x = .data[[time_col]], y = .data[[value_col]])) +
+    geom_boxplot(fill = "steelblue", alpha = 0.7, outlier.color = "red") +
+    labs(
+      title = paste("Distribution", dataset_name, "over Years"),
+      y = df$UNIT_MEASURE,
+      x = time_col
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.x = element_text(angle = 60, hjust = 1),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_blank()
+    )
+}
+```
+
+---
+
+###### Current Health Expenditure per Capita (in current US\$)
+
+```{r}
+plot_obs_time(df_exppc_all, dataset_name = "df_exppc_all")
+```
+
+It makes sense, that we have more outliers, since the distribution of health expenditures per capita varies across countries. Putting them into the same class leads to such a result. Nevertheless, we can observe the following trend: the overall health expenditures per capita rose over time.
+
+---
+
+###### Current Health Expenditure (% of GDP)
+
+```{r}
+plot_obs_time(df_exp_all, dataset_name = "df_exp_all")
+```
+
+Bundling the data by time, we see a slight increase in health expenditure in % of GDP. What is surprising is the strong difference between the year 2023 and the previous years. We might need further analysis to find out the reason for this overall strong increase (assumption: COVID...).
+
+---
+
+###### Life Expectancy at Birth in Years (World Bank)
+
+```{r}
+plot_obs_time(df_oecd_life_exp_WB, dataset_name = "df_oecd_life_exp_WB")
+```
+
+Few outliers in the years 2006 to 2008 and 2020. Moreover, the IQR of the years 2021 varies largely compared to other years.The incluence of COVID gets clearly visible.
+
+---
+
+###### Perceived Health Status (% of Population)
+
+```{r}
+plot_obs_time(df_oecd_healthstat, dataset_name = "df_oecd_healthstat", time_col = "HEALTH_STATUS", value_col = "VALUE")
+```
+
+We see that the majority of people describe their health status as "good/very good". With a few outliers. Would be interesting to which countries these outliers match.
+
+---
+
+###### Life Expectancy in Years (OECD Data Explorer)
+
+```{r}
+plot_obs_time(df_oecd_life_exp, dataset_name = "df_oecd_life_exp", value_col = "VALUE")
+```
+
+Interestingly, we see much more outliers compared to the World Bank data. The reason might lie in the different age groups between both datasets. This is exactly the problem, when visualizing a dataset with multiple dimensions in 2 dimensions. One has to keep this in mind, before drawing conclusions from such plots.
+
+---
+
+#### 4. Know the unit of observation
+
+##### Current Health Expenditure per Capita (in current US\$)
+
+From the `data360/metadata` we now, that the dataset includes `geographic_units` (*type: Region* (e.g. "AFE" = Eastern & Southern Africa),*type: Other Areas* (e.g. "EMU" = Euro area), *type: Income Group* (e.g. "HIC" = High income) as well as `ref_country` (e.g. "ALB" = Albania). We have annual data from 2000 to 2022.
+
+---
+
+##### Current Health Expenditure (% of GDP)
+
+Same unit of observations as in df_exppc_all but, the annual data has the time range 2000-2023.
+
+---
+
+##### Life Expectancy at Birth in Years (World Bank)
+
+As described in the corresponding section (1.2.1) we only derived data of the 38 OECD countries. Beside that, we only defined the time period from 2000-2023 (annual).
+
+---
+
+##### Perceived Health Status (% of Population)
+
+We deal with the 38 OECD countries. Furthermore, we have the healthstatus ‘good/very good [G]' (or excellent) (all positive response categories), ‘fair [F]’ (not good, not bad), ‘bad/very bad [B]’ (all negative response categories). So three categories. We have the following age groups: 15-24 years old, 25-44 years old, 45-64 years old ,over 65 years,over 15 years. The annual data reaches from year 2000 to 2023. We didn't separate male and female.
+
+---
+
+##### Life Expectancy in Years (OECD Data Explorer)
+
+For life expectancy we are again dealing with the 38 OECD-countries. The data includes the ages 0, 40, 60, 65 and 80 years old. We took the total of male and female data. For this annual data we used the time period from 2000-2023.
+
+---
+
+#### 5. Know the time structure (panel vs cross-section data)
+
+For this question, we set up a function, that gives us an overview of the time structure for each dataset. We therefore group the data by the `ref_col` (e.g. REF_AREA) and count the not NaN entries of the `value_col`. We included the `time_col` since we could easily also group by `ref_col` AND `time_col` to get granular details:
+
+```{r}
+# Set up the function
+count_observations <- function(df, ref_col = "REF_AREA", time_col = "TIME_PERIOD", value_col = "OBS_VALUE"){
+  df %>%
+    group_by(.data[[ref_col]]) %>%
+    summarise(n_obs = sum(!is.na(.data[[value_col]])), .groups = "drop") %>%
+    arrange(.data[[ref_col]])
+}
+
+# Counts for first data set
+counts_exppc <- count_observations(df_exppc_all,
+                                   ref_col = "REF_AREA",
+                                   time_col = "TIME_PERIOD",
+                                   value_col = "OBS_VALUE") %>%
+  select(REF_AREA, n_obs) %>%
+  rename(n_obs_df_exppc_all = n_obs)
+
+# Counts for second data set
+counts_exp <- count_observations(df_exp_all,
+                                 ref_col = "REF_AREA",
+                                 time_col = "TIME_PERIOD",
+                                 value_col = "OBS_VALUE") %>%
+  select(REF_AREA, n_obs) %>%
+  rename(n_obs_df_exp_all = n_obs)
+
+# Counts for third data set
+counts_oecd_life_exp_WB <- count_observations(df_oecd_life_exp_WB,
+                                              ref_col = "REF_AREA",
+                                              time_col = "TIME_PERIOD",
+                                              value_col = "OBS_VALUE") %>%
+  select(REF_AREA, n_obs) %>%
+  rename(n_obs_df_oecd_life_exp_WBl = n_obs)
+
+# Counts for fourth data set
+counts_oecd_healthstat <- count_observations(df_oecd_healthstat,
+                                             ref_col = "REF_AREA",
+                                             time_col = "TIME_PERIOD",
+                                             value_col = "VALUE") %>%
+  select(REF_AREA, n_obs) %>%
+  rename(n_obs_df_oecd_healthstat = n_obs)
+
+# Counts for fifth data set
+counts_oecd_life_exp <- count_observations(df_oecd_life_exp,
+                                             ref_col = "REF_AREA",
+                                             time_col = "TIME_PERIOD",
+                                             value_col = "VALUE") %>%
+  select(REF_AREA, n_obs) %>%
+  rename(n_obs_df_oecd_life_exp = n_obs)
+
+all_counts <- list(counts_exppc, counts_exp, counts_oecd_life_exp_WB, counts_oecd_healthstat,counts_oecd_life_exp)
+
+combined_counts <- reduce(all_counts, full_join, by = "REF_AREA")
+combined_counts
+
+```
+
+::: {.callout-note title="Time structure of our datasets"}
+Across our datasets, we consistently observe country-level data recorded over multiple years, which means they primarily have a panel structure.
+
+The World Bank datasets df_exp_all and df_exppc_all include repeated observations for each country over a long time period, typically from 2000 to 2023 and 2000 to 2022, respectively. These datasets allowing us to study changes in health expenditure over time across the world.
+
+The OECD-based datasets (df_oecd_life_exp_WB, df_oecd_healthstat and df_oecd_life_exp) cover a smaller set of OECD member countries but follow the same structure, with annual data for each country regarding life expectancy at birth and perceived health status.
+:::
+
+---
+
+### 1.3.2 Data dimensions and structure
+
+*Report the dimensions of your data frames (number of rows and columns). Comment on their structure and describe the types of variables they contain (for example, character, numeric, factor, date, etc.). \[2 pts\]*
+
+#### Combined Summary Data Set
+
+In order to get a high-level overview over the data dimensions and structure of our data sets, we create a summary dataframe which contains how many observations (rows) and columns (features) [dimension component] and how many features are numeric, characters or factors [structure component]:
+
+```{r}
+# Function to summarize one dataset
+summarize_df <- function(df, name) {
+  tibble(
+    Dataset = name,
+    Rows = nrow(df),
+    Columns = ncol(df),
+    Character = sum(sapply(df, is.character)),
+    Numeric = sum(sapply(df, is.numeric)),
+    Factor = sum(sapply(df, is.factor)),
+    Logical = sum(sapply(df, is.logical))
+  )
+}
+
+df_list <- list(
+  df_exp_all = df_exp_all,
+  df_exppc_all = df_exppc_all,
+  df_oecd_life_exp_WB = df_oecd_life_exp_WB,
+  df_oecd_healthstat = df_oecd_healthstat,
+  df_oecd_life_exp = df_oecd_life_exp
+)
+
+df_summary <- map2_dfr(df_list, names(df_list), summarize_df)
+df_summary
+
+```
+
+#### Analysis Data Structure
+
+Across all datasets, most variables are of type character, representing categorical or identifier fields such as country codes (`REF_AREA`), indicator names, and source information.
+
+The numeric variables (typically three per dataset) contain the actual quantitative observations, such as health expenditure values (`OBS_VALUE` or `VALUE`) and corresponding year indicators (`TIME_PERIOD`).
+There are no factor or date variables, meaning categorical data is stored as character strings rather than predefined factor levels, and time is represented numerically (e.g., 2000, 2001, …).
+
+---
+
+## 1.4 Save your data
+
+*Now that you have imported your data, save them locally on your computer to use in the second part of the homework. Explain which file format you chose and why you selected this format. [2 pts]*
+
+After importing the data, we saved all datasets locally in `CSV format`. This choice is based on both the structure of our data and practical considerations for the future.
+
+Although the data were originally retrieved in `JSON format`, they were transformed into **flat data frames** during the importing process, with each observation represented as a single row and it's attributes as columns. Since the hierarchical structure of the original JSON files is no longer relevant at this stage, a tabular format such as CSV is most appropriate.
+
+The CSV format is lightweight, human-readable, and easy compatible with most analytical tools. Furthermore, from previous courses in data science we are more familiar with the CSV format. While some metadata and nested relationships from the original JSON files are lost, the retained observation values and their associated attributes are sufficient for our analytical purposes in the next part of the assignment (at least that's our assumption).
+
+Let's now save our datasets with their name as a `CSV-file`. We wrote again a function for this :)
+
+```{r}
+save_datasets_csv <- function(datasets, path = ".") {
+  # make sure that the path exists
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE)
+  
+  # iterate over all dataframes and safe them as csv
+  iwalk(datasets, function(df, name) {
+    filename <- file.path(path, paste0(name, ".csv"))
+    write.csv(df, filename, row.names = FALSE)
+    message("saved: ", filename)
+  })
+}
+```
+
+```{r}
+#| message: true
+save_datasets_csv(datasets, path = "Data")
+```
+
