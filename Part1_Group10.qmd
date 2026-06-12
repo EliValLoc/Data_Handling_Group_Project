@@ -1,5 +1,5 @@
 ---
-title: "Group Project Part 1 - Group 10"
+title: "Group Project Part 1"
 subtitle: "3,230: Data Handling: Import, Cleaning and Visualisation - Autumn Semester 2025"
 author:
   - name: Alessio De Simeis
