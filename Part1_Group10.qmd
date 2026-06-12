@@ -2,10 +2,10 @@
 title: "Group Project Part 1 - Group 10"
 subtitle: "3,230: Data Handling: Import, Cleaning and Visualisation - Autumn Semester 2025"
 author:
-  - name: Alessio De Simeis (24-621-476)
-  - name: Elia Valentin Locher (21-941-000)
-  - name: Marco Molnar (21-917-315)
-  - name: Lars Wyssen (24-617-771)
+  - name: Alessio De Simeis
+  - name: Elia Valentin Locher
+  - name: Marco Molnar
+  - name: Lars Wyssen
 date: "November 2025"
 format:
   html:
